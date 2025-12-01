@@ -37,35 +37,56 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 def detect_document_quads_multi(
     image_bgr: np.ndarray,
-    roi_from_top_ratio: float = 0.4,
-    min_area_ratio: float = 0.005,
+    roi_top_ratio: float = 0.25,
+    roi_bottom_ratio: float = 0.95,
+    min_area_ratio: float = 0.02,
+    min_aspect: float = 0.2,
+    max_aspect: float = 5.0,
+    max_docs: int = 10,
 ) -> list[np.ndarray]:
     """Detect multiple document quadrilaterals in a single image."""
 
-    height, width = image_bgr.shape[:2]
-    y0 = int(height * roi_from_top_ratio)
-    roi = image_bgr[y0:, :]
+    h, w = image_bgr.shape[:2]
+    y0 = int(h * roi_top_ratio)
+    y1 = int(h * roi_bottom_ratio)
+    roi = image_bgr[y0:y1, :]
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 75, 200)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
 
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    kernel = np.ones((9, 9), np.uint8)
+    dilated = cv2.dilate(edges, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     roi_area = float(roi.shape[0] * roi.shape[1])
 
-    quads: list[np.ndarray] = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
+    candidates: list[tuple[np.ndarray, float]] = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
         if area < min_area_ratio * roi_area:
             continue
 
-        rect = cv2.minAreaRect(contour)
+        rect = cv2.minAreaRect(cnt)
         box = cv2.boxPoints(rect).astype("float32")
-        box[:, 1] += y0
-        ordered = order_points(box)
-        quads.append(ordered)
+        (_, _), (w_box, h_box), _ = rect
 
-    quads.sort(key=lambda quad: cv2.contourArea(quad.astype("float32")), reverse=True)
+        if w_box <= 0 or h_box <= 0:
+            continue
+
+        aspect = max(w_box, h_box) / min(w_box, h_box)
+        if aspect < min_aspect or aspect > max_aspect:
+            continue
+
+        box[:, 1] += y0
+
+        quad = order_points(box)
+        candidates.append((quad, area))
+
+    candidates.sort(key=lambda c: c[1], reverse=True)
+    quads = [c[0] for c in candidates[:max_docs]]
+
     return quads
 
 
