@@ -97,53 +97,86 @@ def calculate_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, 
     return intersection / union if union else 0.0
 
 def detect_documents(image: np.ndarray) -> List[np.ndarray]:
-    """Detect document quadrilaterals in the image using contour detection."""
+    """
+    Detect document quadrilaterals in the image using contour detection.
+    Returns a list of 4x2 float32 points in the original image coordinates.
+    """
+    # まずは処理用にリサイズ
     resized, ratio_x, ratio_y = resize_for_processing(image)
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 75, 200)
 
     contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    image_area = resized.shape[0] * resized.shape[1]
+    image_area = float(resized.shape[0] * resized.shape[1])
 
+    # (四角形の4点, スコア, バウンディングボックス) のリスト
     candidates: List[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = []
+
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 0.02 * image_area:
+        # ★ 面積の下限を 2% → 0.5% に緩める（小さいレシートも拾う）
+        if area < 0.005 * image_area:
             continue
+
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        if len(approx) != 4:
+
+        # ★ 「4点ぴったり」ではなく「4点以上」で許容
+        if len(approx) < 4:
             continue
-        approx_points = approx.reshape(4, 2).astype("float32")
-        rect = cv2.boundingRect(approx_points)
-        box = (rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3])
-        width = rect[2]
-        height = rect[3]
+
+        # いったん全頂点を float32 の (N,2) にする
+        approx_points = approx.reshape(-1, 2).astype("float32")
+
+        # ★ 頂点が多い場合でも、最小外接矩形から必ず4点を作る
+        rect = cv2.minAreaRect(approx_points)
+        box_points = cv2.boxPoints(rect).astype("float32")
+
+        x_min = int(box_points[:, 0].min())
+        y_min = int(box_points[:, 1].min())
+        x_max = int(box_points[:, 0].max())
+        y_max = int(box_points[:, 1].max())
+        box = (x_min, y_min, x_max, y_max)
+
+        width = x_max - x_min
+        height = y_max - y_min
         aspect_ratio = width / float(height) if height else 0.0
+
+        # A4 に近いほどスコアを上げる（ただしレシートも候補には残す）
         a4_ratio = 1 / 1.414  # width / height
         ratio_score = 1 - abs(aspect_ratio - a4_ratio)
         score = area * max(ratio_score, 0.0)
-        candidates.append((approx_points, score, box))
 
-    # Sort by score (area + aspect ratio closeness)
+        candidates.append((box_points, score, box))
+
+    # 面積＋アスペクト比のスコアでソート（大きくてA4に近いものが先）
     candidates.sort(key=lambda c: c[1], reverse=True)
 
     selected: List[np.ndarray] = []
     selected_boxes: List[Tuple[int, int, int, int]] = []
+
     for points, _, box in candidates:
-        if any(calculate_iou(box, existing) > 0.3 for existing in selected_boxes):
+        # ★ IoU の閾値を 0.3 → 0.5 にして、別の書類を潰しにくくする
+        if any(calculate_iou(box, existing) > 0.5 for existing in selected_boxes):
             continue
+
+        # 座標を「左上, 右上, 右下, 左下」に整え、元サイズにスケールバック
         ordered = order_points(points)
         ordered[:, 0] *= ratio_x
         ordered[:, 1] *= ratio_y
         selected.append(ordered)
-        selected_boxes.append((
-            int(ordered[:, 0].min()),
-            int(ordered[:, 1].min()),
-            int(ordered[:, 0].max()),
-            int(ordered[:, 1].max()),
-        ))
+
+        # 選択済みボックスを更新
+        selected_boxes.append(
+            (
+                int(ordered[:, 0].min()),
+                int(ordered[:, 1].min()),
+                int(ordered[:, 0].max()),
+                int(ordered[:, 1].max()),
+            )
+        )
+
     return selected
 
 def crop_and_warp_document(image: np.ndarray, points: np.ndarray) -> Image.Image:
