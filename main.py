@@ -109,14 +109,15 @@ def detect_documents(image: np.ndarray) -> List[np.ndarray]:
 
     contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     image_area = float(resized.shape[0] * resized.shape[1])
+    MIN_AREA_RATIO = 0.0003
 
     # (四角形の4点, スコア, バウンディングボックス) のリスト
     candidates: List[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = []
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        # ★ 面積の下限を 2% → 0.5% に緩める（小さいレシートも拾う）
-        if area < 0.005 * image_area:
+        # ★ 面積の下限を可変にし、小さいレシートも拾う
+        if area < MIN_AREA_RATIO * image_area:
             continue
 
         peri = cv2.arcLength(contour, True)
