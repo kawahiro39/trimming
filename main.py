@@ -195,14 +195,6 @@ def crop_and_warp_document(image: np.ndarray, points: np.ndarray) -> Image.Image
     target_width = max_width
     target_height = max_height
 
-    # Adjust output to approximate A4 ratio if the detected contour is close to it
-    if max_width and max_height:
-        current_ratio = max_height / float(max_width)
-        desired_ratio = 1.414
-        if abs(current_ratio - desired_ratio) > 0.05:
-            target_width = int(max(max_width, max_height / desired_ratio))
-            target_height = int(max(max_height, max_width * desired_ratio))
-
     destination = np.array(
         [
             [0, 0],
