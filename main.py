@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import base64
 import io
-from typing import List, Tuple
+from typing import List
 
 import cv2
 import fitz
@@ -20,57 +20,10 @@ SUPPORTED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png"}
 SUPPORTED_OUTPUT_FORMATS = {"png": "image/png", "jpeg": "image/jpeg"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
-def image_to_data_uri(pil_image: Image.Image, mime_type: str = "image/png") -> str:
-    """Convert a Pillow image to a data URI string."""
-    buffer = io.BytesIO()
-    format_name = "PNG" if mime_type == "image/png" else "JPEG"
-    pil_image.save(buffer, format=format_name)
-    base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return f"data:{mime_type};base64,{base64_str}"
-
-def read_upload_file(upload_file: UploadFile) -> bytes:
-    """Read uploaded file content and validate size."""
-    data = upload_file.file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="File is empty.")
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File size exceeds limit (25MB).")
-    return data
-
-def process_pdf_to_images(file_bytes: bytes) -> List[Image.Image]:
-    """Convert each page of a PDF to a Pillow RGB image using PyMuPDF."""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    images: List[Image.Image] = []
-    for page in doc:
-        # Render page to a pixmap at 200 DPI for clearer edges.
-        pix = page.get_pixmap(dpi=200, colorspace=fitz.csRGB)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(img)
-    return images
-
-def load_image_file(file_bytes: bytes) -> Image.Image:
-    """Load a single image file into a Pillow image."""
-    try:
-        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail="Invalid image file.") from exc
-    return image
-
-def resize_for_processing(image: np.ndarray, max_dim: int = 2000) -> Tuple[np.ndarray, float, float]:
-    """Resize image while keeping aspect ratio so that longest side ~= max_dim."""
-    height, width = image.shape[:2]
-    scale = max(height, width) / float(max_dim)
-    if scale <= 1:
-        return image, 1.0, 1.0
-    new_width = int(width / scale)
-    new_height = int(height / scale)
-    resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    ratio_x = width / float(new_width)
-    ratio_y = height / float(new_height)
-    return resized, ratio_x, ratio_y
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """Order points as top-left, top-right, bottom-right, bottom-left."""
+    """Order four points as top-left, top-right, bottom-right, bottom-left."""
+
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -81,164 +34,150 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-def calculate_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
-    """Calculate Intersection over Union for two bounding boxes."""
-    x_left = max(box_a[0], box_b[0])
-    y_top = max(box_a[1], box_b[1])
-    x_right = min(box_a[2], box_b[2])
-    y_bottom = min(box_a[3], box_b[3])
 
-    if x_right <= x_left or y_bottom <= y_top:
-        return 0.0
-    intersection = (x_right - x_left) * (y_bottom - y_top)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
-    union = area_a + area_b - intersection
-    return intersection / union if union else 0.0
+def detect_document_quads_multi(
+    image_bgr: np.ndarray,
+    roi_from_top_ratio: float = 0.4,
+    min_area_ratio: float = 0.005,
+) -> list[np.ndarray]:
+    """Detect multiple document quadrilaterals in a single image."""
 
-def detect_documents(image: np.ndarray) -> List[np.ndarray]:
-    """
-    Detect document quadrilaterals in the image using contour detection.
-    Returns a list of 4x2 float32 points in the original image coordinates.
-    """
-    # まずは処理用にリサイズ
-    resized, ratio_x, ratio_y = resize_for_processing(image)
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    height, width = image_bgr.shape[:2]
+    y0 = int(height * roi_from_top_ratio)
+    roi = image_bgr[y0:, :]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 75, 200)
 
-    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    image_area = float(resized.shape[0] * resized.shape[1])
-    MIN_AREA_RATIO = 0.0003
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    roi_area = float(roi.shape[0] * roi.shape[1])
 
-    # (四角形の4点, スコア, バウンディングボックス) のリスト
-    candidates: List[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = []
-
+    quads: list[np.ndarray] = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        # ★ 面積の下限を可変にし、小さいレシートも拾う
-        if area < MIN_AREA_RATIO * image_area:
+        if area < min_area_ratio * roi_area:
             continue
 
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect).astype("float32")
+        box[:, 1] += y0
+        ordered = order_points(box)
+        quads.append(ordered)
 
-        # ★ 「4点ぴったり」ではなく「4点以上」で許容
-        if len(approx) < 4:
-            continue
+    quads.sort(key=lambda quad: cv2.contourArea(quad.astype("float32")), reverse=True)
+    return quads
 
-        # いったん全頂点を float32 の (N,2) にする
-        approx_points = approx.reshape(-1, 2).astype("float32")
 
-        # ★ 頂点が多い場合でも、最小外接矩形から必ず4点を作る
-        rect = cv2.minAreaRect(approx_points)
-        box_points = cv2.boxPoints(rect).astype("float32")
+def warp_quad(image_bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    """Apply perspective transform to obtain a top-down view of the quad region."""
 
-        x_min = int(box_points[:, 0].min())
-        y_min = int(box_points[:, 1].min())
-        x_max = int(box_points[:, 0].max())
-        y_max = int(box_points[:, 1].max())
-        box = (x_min, y_min, x_max, y_max)
-
-        width = x_max - x_min
-        height = y_max - y_min
-        aspect_ratio = width / float(height) if height else 0.0
-
-        # A4 に近いほどスコアを上げる（ただしレシートも候補には残す）
-        a4_ratio = 1 / 1.414  # width / height
-        ratio_score = 1 - abs(aspect_ratio - a4_ratio)
-        score = area * max(ratio_score, 0.0)
-
-        candidates.append((box_points, score, box))
-
-    # 面積＋アスペクト比のスコアでソート（大きくてA4に近いものが先）
-    candidates.sort(key=lambda c: c[1], reverse=True)
-
-    selected: List[np.ndarray] = []
-    selected_boxes: List[Tuple[int, int, int, int]] = []
-
-    for points, _, box in candidates:
-        # ★ IoU の閾値を 0.3 → 0.5 にして、別の書類を潰しにくくする
-        if any(calculate_iou(box, existing) > 0.5 for existing in selected_boxes):
-            continue
-
-        # 座標を「左上, 右上, 右下, 左下」に整え、元サイズにスケールバック
-        ordered = order_points(points)
-        ordered[:, 0] *= ratio_x
-        ordered[:, 1] *= ratio_y
-        selected.append(ordered)
-
-        # 選択済みボックスを更新
-        selected_boxes.append(
-            (
-                int(ordered[:, 0].min()),
-                int(ordered[:, 1].min()),
-                int(ordered[:, 0].max()),
-                int(ordered[:, 1].max()),
-            )
-        )
-
-    return selected
-
-def crop_and_warp_document(image: np.ndarray, points: np.ndarray) -> Image.Image:
-    """Perform perspective transform to obtain a top-down view of the document."""
-    rect = order_points(points)
+    rect = order_points(quad)
     (tl, tr, br, bl) = rect
 
     width_a = np.linalg.norm(br - bl)
     width_b = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b))
-
     height_a = np.linalg.norm(tr - br)
     height_b = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b))
 
-    target_width = max_width
-    target_height = max_height
+    max_width = int(max(width_a, width_b))
+    max_height = int(max(height_a, height_b))
 
     destination = np.array(
         [
             [0, 0],
-            [target_width - 1, 0],
-            [target_width - 1, target_height - 1],
-            [0, target_height - 1],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
         ],
         dtype="float32",
     )
 
     matrix = cv2.getPerspectiveTransform(rect, destination)
-    warped = cv2.warpPerspective(image, matrix, (target_width, target_height))
-    return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+    warped = cv2.warpPerspective(image_bgr, matrix, (max_width, max_height))
+    return warped
 
-def process_page(image: Image.Image, image_format: str) -> List[dict]:
-    """Process a single page image and return cropped document metadata."""
-    cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    candidates = detect_documents(cv_image)
 
-    if not candidates:
-        h, w = cv_image.shape[:2]
-        candidates = [np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype="float32")]
+def image_to_data_uri(pil_image: Image.Image, mime_type: str = "image/png") -> str:
+    """Convert a Pillow image to a data URI string."""
+
+    buffer = io.BytesIO()
+    format_name = "PNG" if mime_type == "image/png" else "JPEG"
+    pil_image.save(buffer, format=format_name)
+    base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:{mime_type};base64,{base64_str}"
+
+
+def read_upload_file(upload_file: UploadFile) -> bytes:
+    """Read uploaded file content and validate size."""
+
+    data = upload_file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="File is empty.")
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File size exceeds limit (25MB).")
+    return data
+
+
+def process_pdf_to_bgr_images(file_bytes: bytes) -> List[np.ndarray]:
+    """Convert each page of a PDF to a BGR numpy image using PyMuPDF."""
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    images: List[np.ndarray] = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=200, colorspace=fitz.csRGB)
+        array = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, 3))
+        bgr = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        images.append(bgr)
+    return images
+
+
+def load_image_file_to_bgr(file_bytes: bytes) -> np.ndarray:
+    """Load a single image file into a BGR numpy array."""
+
+    image_array = np.frombuffer(file_bytes, np.uint8)
+    image_bgr = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise HTTPException(status_code=400, detail="Invalid image file.")
+    return image_bgr
+
+
+def process_page_documents(page_bgr: np.ndarray, image_format: str, page_index: int) -> List[dict]:
+    """Detect, warp, and encode documents for a single page image."""
+
+    quads = detect_document_quads_multi(page_bgr)
+    if not quads:
+        height, width = page_bgr.shape[:2]
+        quads = [
+            np.array(
+                [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+                dtype="float32",
+            )
+        ]
 
     documents: List[dict] = []
-    for doc_index, points in enumerate(candidates):
-        cropped = crop_and_warp_document(cv_image, points)
-        mime_type = SUPPORTED_OUTPUT_FORMATS[image_format]
-        data_uri = image_to_data_uri(cropped, mime_type)
-        width, height = cropped.size
+    mime_type = SUPPORTED_OUTPUT_FORMATS[image_format]
+    for doc_index, quad in enumerate(quads):
+        warped = warp_quad(page_bgr, quad)
+        pil_image = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+        data_uri = image_to_data_uri(pil_image, mime_type)
         documents.append(
             {
+                "page_index": page_index,
                 "doc_index": doc_index,
                 "mime_type": mime_type,
-                "width": width,
-                "height": height,
+                "width": pil_image.width,
+                "height": pil_image.height,
                 "data_uri": data_uri,
             }
         )
     return documents
 
+
 @app.post("/crop-documents")
 async def crop_documents(file: UploadFile = File(...), image_format: str = "png") -> JSONResponse:
     """Detect and crop documents from an uploaded PDF or image file."""
+
     if image_format not in SUPPORTED_OUTPUT_FORMATS:
         raise HTTPException(status_code=400, detail="Unsupported image_format. Use 'png' or 'jpeg'.")
 
@@ -247,20 +186,17 @@ async def crop_documents(file: UploadFile = File(...), image_format: str = "png"
 
     file_bytes = read_upload_file(file)
 
-    pages: List[Image.Image]
     if file.content_type == "application/pdf":
-        pages = process_pdf_to_images(file_bytes)
+        pages = process_pdf_to_bgr_images(file_bytes)
     else:
-        pages = [load_image_file(file_bytes)]
+        pages = [load_image_file_to_bgr(file_bytes)]
 
     all_documents: List[dict] = []
-    for page_index, page in enumerate(pages):
-        page_documents = process_page(page, image_format)
-        for doc in page_documents:
-            doc["page_index"] = page_index
-            all_documents.append(doc)
+    for page_index, page_bgr in enumerate(pages):
+        all_documents.extend(process_page_documents(page_bgr, image_format, page_index))
 
     return JSONResponse(content={"documents": all_documents})
+
 
 if __name__ == "__main__":
     import uvicorn
